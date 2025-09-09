@@ -162,6 +162,8 @@ if st.button("제출"):
         st.error("이름 또는 개인 고유번호가 올바르지 않습니다.")
         st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
     else:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         if status == "출석":
             if partner.strip() == "":
                 st.error("오늘 같이 활동한 사람을 입력하세요.")
@@ -174,11 +176,11 @@ if st.button("제출"):
                     st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
                 else:
                     st.success(f"{name}님 출석 완료 ✅")
-                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sheet.append_row([name, now_str, "출석", partner])
+                    # ✅ 6개 컬럼 맞추어 기록
+                    sheet.append_row([name, now_str, "출석", time_slot, partner, ""])
                     if "local_attendance" not in st.session_state:
                         st.session_state.local_attendance = []
-                    st.session_state.local_attendance.append([name, now_str, "출석", partner])
+                    st.session_state.local_attendance.append([name, now_str, "출석", time_slot, partner, ""])
                     st.cache_data.clear()
                     st.session_state.attendance_input = ""
                     st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
@@ -188,11 +190,11 @@ if st.button("제출"):
                 st.error("결석 사유를 입력하세요.")
             else:
                 st.success(f"{name}님 결석 처리 완료 ✅")
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.append_row([name, now_str, "결석", st.session_state.absence_reason])
+                # ✅ 6개 컬럼 맞추어 기록
+                sheet.append_row([name, now_str, "결석", "", "", st.session_state.absence_reason])
                 if "local_attendance" not in st.session_state:
                     st.session_state.local_attendance = []
-                st.session_state.local_attendance.append([name, now_str, "결석", st.session_state.absence_reason])
+                st.session_state.local_attendance.append([name, now_str, "결석", "", "", st.session_state.absence_reason])
                 st.cache_data.clear()
 
 
