@@ -11,10 +11,12 @@ SCOPES = [
 
 @st.cache_resource
 def get_gspread_client():
-    creds = Credentials.from_service_account_file(
-        "service_account.json",
-        scopes=SCOPES,
-    )
+    # TOML에 triple-quoted로 넣었으면 \n 복원 필요 없음
+    svc_info = dict(st.secrets["gcp_service_account"])
+    # 만약 TOML에 한 줄 문자열로 넣어 \n이 이스케이프라면 아래 주석 해제
+    # svc_info["private_key"] = svc_info["private_key"].replace("\\n", "\n")
+
+    creds = Credentials.from_service_account_info(svc_info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
