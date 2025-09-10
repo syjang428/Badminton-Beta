@@ -3,7 +3,56 @@ import pandas as pd
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
+import time
+import threading
+import uuid
+from gspread.exceptions import APIError
 
+@st.cache_resource
+def get_sheet_lock():
+    # 서버 프로세스 전역에서 하나만 생성되어 모든 세션이 공유
+    return threading.Lock()
+
+sheet_lock = get_sheet_lock()
+
+_RETRY_HINTS = ("rate limit", "quota", "backendError", "internal error", "timeout", "429", "503", "500")
+
+def safe_append_row(ws, row_values, max_retries=7):
+    """
+    Google Sheets append_row 안전 호출:
+    - 전역 락으로 동시 호출 직렬화
+    - 429/5xx/일시 오류 지수 백오프 재시도
+    """
+    delay = 0.6
+    for attempt in range(1, max_retries + 1):
+        try:
+            with sheet_lock:
+                ws.append_row(row_values, value_input_option="USER_ENTERED")
+            return True
+        except APIError as e:
+            msg = str(e).lower()
+            if any(h in msg for h in _RETRY_HINTS):
+                time.sleep(delay)
+                delay = min(delay * 2, 8.0)
+                continue
+            raise
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    return False
+
+@st.cache_data(ttl=30)
+def existing_tokens(_ws, sheet_key: str):
+    """
+    _ws: gspread Worksheet (언더스코어 → 캐시 해시 대상에서 제외)
+    sheet_key: 캐시 키로 쓸 해시 가능한 문자열(스프레드시트ID:워크시트ID/제목)
+    """
+    try:
+        records = _ws.get_all_records()
+        return {str(r.get("토큰", "")).strip() for r in records if r.get("토큰")}
+    except Exception:
+        return set()
+    
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -29,6 +78,10 @@ workbook = client.open(SPREADSHEET_NAME)
 
 sheet = workbook.worksheet("출석기록")    # 출석 기록용
 code_sheet = workbook.worksheet("출석코드")  # 출석 코드 저장용
+
+# 캐시 키(스프레드시트ID:워크시트ID) - gspread 버전에 따라 .id가 없으면 제목으로 폴백
+SHEET_KEY = f"{sheet.spreadsheet.id}:{getattr(sheet, 'id', sheet.title)}"
+
 
 
 # 오늘 날짜 데이터만 분리하고 상태별로 나누는 함수
@@ -116,10 +169,15 @@ if st.session_state.admin_mode:
         if st.button("출석 코드 저장"):
             if code_input.strip() != "":
                 st.session_state.admin_code = code_input
-                code_sheet.clear()
-                code_sheet.append_row([code_input, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                st.success("출석 코드가 저장되었습니다.")
-                st.cache_data.clear()  # ✅ 캐시 초기화 (출석 코드 갱신됨)
+                # clear/append도 경합 방지
+                with sheet_lock:
+                    code_sheet.clear()
+                ok = safe_append_row(code_sheet, [code_input, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                if ok:
+                    st.success("출석 코드가 저장되었습니다.")
+                    st.cache_data.clear()
+                else:
+                    st.error("코드 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
 
         if st.button("관리자 모드 해제"):
@@ -194,27 +252,45 @@ if st.button("제출"):
                     st.error("출석 코드가 올바르지 않습니다.")
                     st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
                 else:
-                    st.success(f"{name}님 출석 완료 ✅")
-                    # ✅ 6개 컬럼 맞추어 기록
-                    sheet.append_row([name, now_str, "출석", time_slot, partner, ""])
-                    if "local_attendance" not in st.session_state:
-                        st.session_state.local_attendance = []
-                    st.session_state.local_attendance.append([name, now_str, "출석", time_slot, partner, ""])
-                    st.cache_data.clear()
-                    st.session_state.attendance_input = ""
-                    st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
+                    token = str(uuid.uuid4())[:8]  # idempotency 토큰
+                    values = [name, now_str, "출석", time_slot, partner, "", token]  # 마지막에 '토큰' 컬럼 추가
+
+                    tokens = existing_tokens(sheet, SHEET_KEY)
+                    if token in tokens:
+                        st.info("이미 처리된 요청입니다 (중복 제출 방지).")
+                    else:
+                        ok = safe_append_row(sheet, values)
+                        if ok:
+                            st.success(f"{name}님 출석 완료 ✅")
+                            if "local_attendance" not in st.session_state:
+                                st.session_state.local_attendance = []
+                            st.session_state.local_attendance.append(values)
+                            st.cache_data.clear()
+                            st.session_state.attendance_input = ""
+                            st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
+                        else:
+                            st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
         elif status == "결석":
             if st.session_state.absence_reason.strip() == "":
                 st.error("결석 사유를 입력하세요.")
             else:
-                st.success(f"{name}님 결석 처리 완료 ✅")
-                # ✅ 6개 컬럼 맞추어 기록
-                sheet.append_row([name, now_str, "결석", "", "", st.session_state.absence_reason])
-                if "local_attendance" not in st.session_state:
-                    st.session_state.local_attendance = []
-                st.session_state.local_attendance.append([name, now_str, "결석", "", "", st.session_state.absence_reason])
-                st.cache_data.clear()
+                token = str(uuid.uuid4())[:8]
+                values = [name, now_str, "결석", "", "", st.session_state.absence_reason, token]
+
+                tokens = existing_tokens(sheet, SHEET_KEY)
+                if token in tokens:
+                    st.info("이미 처리된 요청입니다 (중복 제출 방지).")
+                else:
+                    ok = safe_append_row(sheet, values)
+                    if ok:
+                        st.success(f"{name}님 결석 처리 완료 ✅")
+                        if "local_attendance" not in st.session_state:
+                            st.session_state.local_attendance = []
+                        st.session_state.local_attendance.append(values)
+                        st.cache_data.clear()
+                    else:
+                        st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
 
 # ================== 출석 현황 대시보드 (관리자 전용) ==================
