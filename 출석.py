@@ -31,6 +31,25 @@ sheet = workbook.worksheet("출석기록")    # 출석 기록용
 code_sheet = workbook.worksheet("출석코드")  # 출석 코드 저장용
 
 
+# 오늘 날짜 데이터만 분리하고 상태별로 나누는 함수
+def split_today_status(df):
+    today = datetime.today().strftime("%Y-%m-%d")
+    today_att = df[df["날짜"] == today].copy()
+
+    if "출석여부" not in today_att.columns:
+        raise KeyError("⚠️ DataFrame에 '출석여부' 컬럼이 없습니다.")
+
+    if "이름" not in today_att.columns:
+        raise KeyError("⚠️ DataFrame에 '이름' 컬럼이 없습니다.")
+
+    df_attended = today_att[today_att["출석여부"] == "출석"].copy()
+    df_absented = today_att[today_att["출석여부"] == "결석"].copy()
+    df_unchecked = today_att[today_att["출석여부"].isna()].copy()
+
+    total_members = len(today_att["이름"].unique())
+
+    return df_attended, df_absented, df_unchecked, total_members
+
 # ------------------ CSV 불러오기 ------------------
 @st.cache_data  # ✅ TTL 제거 → 완전 캐싱 (앱 새로 실행하기 전까지는 다시 안 불러옴)
 def load_members():
@@ -199,11 +218,12 @@ if st.button("제출"):
 
 
 # ================== 출석 현황 대시보드 (관리자 전용) ==================
+# ================== 출석 현황 대시보드 (관리자 전용) ==================
 @st.cache_data(ttl=300)  # 5분 캐싱
 def get_attendance_df():
     """출석기록 시트를 DataFrame으로 불러오기 (헤더 자동 인식)"""
     try:
-        df_att = pd.DataFrame(sheet.get_all_records())  # 헤더 = 첫 행
+        df_att = pd.DataFrame(sheet.get_all_records())  # 시트 헤더 첫 행
         if df_att.empty:
             return pd.DataFrame(columns=["이름", "시간", "상태", "사유"])
         return df_att
@@ -212,50 +232,57 @@ def get_attendance_df():
         return pd.DataFrame(columns=["이름", "시간", "상태", "사유"])
 
 
-def split_today_status(df_att: pd.DataFrame):
-    """오늘 기준 출석/결석/미체크 목록 반환"""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    # 오늘 행만 필터 (시간 포맷이 'YYYY-MM-DD HH:MM:SS' 이므로 startswith 사용)
-    today_att = df_att[df_att["시간"].str.startswith(today_str, na=False)].copy()
+def split_today_status(df_att, all_members):
+    import datetime
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
+    # 컬럼 탐색
+    col_time = next((c for c in df_att.columns if "시간" in c or "날짜" in c or "등록" in c), None)
+    col_status = next((c for c in df_att.columns if "출석" in c or "상태" in c), None)
+    col_name = next((c for c in df_att.columns if "이름" in c or "성명" in c), None)
 
-    # 오늘 출석/결석자
-    attended = set(today_att.loc[today_att["상태"] == "출석", "이름"])
-    absented = set(today_att.loc[today_att["상태"] == "결석", "이름"])
+    if not col_time or not col_status or not col_name:
+        st.error("출석 기록에서 필수 컬럼을 찾을 수 없습니다.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), len(all_members)
 
+    # 오늘 날짜 필터링
+    today_att = df_att[df_att[col_time].astype(str).str.startswith(today_str, na=False)].copy()
 
-    # 전체 부원 이름 세트 (CSV 기준)
-    all_members = set(df["이름"].dropna().astype(str))
+    # 출석/결석 분류
+    df_attended = today_att[today_att[col_status] == "출석"].copy()
+    df_absented = today_att[today_att[col_status] == "결석"].copy()
 
+    # 중복 이름 제거
+    df_attended = df_attended.drop_duplicates(subset=[col_name])
+    df_absented = df_absented.drop_duplicates(subset=[col_name])
 
-    # 오늘 미체크자 = 전체 - (출석 ∪ 결석)
-    unchecked = all_members - (attended | absented)
+    # 출석 우선
+    df_absented = df_absented[~df_absented[col_name].isin(df_attended[col_name])]
 
+    # 미체크자 계산
+    submitted_names = [str(name).strip() for name in today_att[col_name].tolist()]
+    all_member_names = [str(name).strip() for name in all_members["이름"].tolist()]
+    unchecked_names = [name for name in all_member_names if name not in submitted_names]
 
-    # 보기 좋게 DataFrame 구성
-    df_attended = pd.DataFrame(sorted(attended), columns=["이름"])
-    df_absented = pd.DataFrame(
-        sorted(absented), columns=["이름"]
-    ).merge(
-        today_att.loc[today_att["상태"] == "결석", ["이름", "사유"]],
-        on="이름",
-        how="left"
-    ).drop_duplicates(subset=["이름"])
-    df_unchecked = pd.DataFrame(sorted(unchecked), columns=["이름"])
-
+    df_unchecked = pd.DataFrame(unchecked_names, columns=["이름"])
 
     return df_attended, df_absented, df_unchecked, len(all_members)
 
 
+# ====== 관리자 대시보드 표시 ======
+# ================== 관리자 대시보드 표시용 (안전 수정) ==================
+# =================== 관리자 대시보드 표시용 (컬럼 자동 탐색) ===================
+# ====== 관리자 대시보드 표시 ======
+# ================== 관리자 대시보드 표시 (출석/결석/미체크) ==================
 if st.session_state.admin_mode:
     st.markdown("---")
     st.subheader("📊 오늘의 출석 현황 (관리자)")
 
-
-    # 데이터 조회
+    # 데이터 불러오기
     att_df = get_attendance_df()
-    df_attended, df_absented, df_unchecked, total_members = split_today_status(att_df)
-
+    
+    # 오늘 기준으로 출석/결석/미체크 분류
+    df_attended, df_absented, df_unchecked, total_members = split_today_status(att_df, df)
 
     # 지표
     col1, col2, col3, col4 = st.columns(4)
@@ -264,37 +291,60 @@ if st.session_state.admin_mode:
     col3.metric("결석", len(df_absented))
     col4.metric("미체크", len(df_unchecked))
 
+    # ==== 컬럼 안전 매핑 함수 정의 ====
+    def map_columns_safe(df):
+        if df.empty:
+            return None, None, None
+        col_name = next((c for c in df.columns if "이름" in c or "성명" in c), None)
+        col_time = next((c for c in df.columns if "시간" in c or "날짜" in c or "등록" in c), None)
+        col_status = next((c for c in df.columns if "출석" in c or "상태" in c), None)
+        return col_name, col_time, col_status
 
-    # 표 표시
+    name_col, time_col, status_col = map_columns_safe(df_attended)
+
+    # ==== 안전하게 컬럼 선택 함수 ====
+    def safe_select(df, cols):
+        existing = [c for c in cols if c and c in df.columns]
+        if not existing:
+            return pd.DataFrame(columns=[c for c in cols if c])
+        return df[existing]
+
+    # 출석/결석/미체크 표시
+    attended_display = safe_select(df_attended, [name_col, time_col, status_col])
+    absented_display = safe_select(df_absented, [name_col, time_col, status_col])
+    unchecked_display = safe_select(df_unchecked, ["이름"])  # ✅ 여기 반드시 "이름" 사용
+
+    # ==== 표 표시 ====
     st.markdown("#### ✅ 출석자")
-    st.table(df_attended)
+    st.table(attended_display)
 
-
-    st.markdown("#### ❌ 결석자 (사유 포함)")
-    st.table(df_absented)
-
+    st.markdown("#### ❌ 결석자")
+    st.table(absented_display)
 
     st.markdown("#### ⏳ 미체크자")
-    st.table(df_unchecked)
+    st.table(unchecked_display)
 
-
-    # 다운로드
+    # ==== CSV 다운로드 버튼 ====
     colD1, colD2, colD3 = st.columns(3)
     colD1.download_button(
         "출석자 CSV 다운로드",
-        data=df_attended.to_csv(index=False, encoding="utf-8-sig"),
+        data=attended_display.to_csv(index=False, encoding="utf-8-sig") if not attended_display.empty else "",
         file_name=f"출석자_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
     colD2.download_button(
         "결석자 CSV 다운로드",
-        data=df_absented.to_csv(index=False, encoding="utf-8-sig"),
+        data=absented_display.to_csv(index=False, encoding="utf-8-sig") if not absented_display.empty else "",
         file_name=f"결석자_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
     colD3.download_button(
         "미체크자 CSV 다운로드",
-        data=df_unchecked.to_csv(index=False, encoding="utf-8-sig"),
+        data=unchecked_display.to_csv(index=False, encoding="utf-8-sig") if not unchecked_display.empty else "",
         file_name=f"미체크자_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
+
+# 비관리자 화면에서는 아무것도 표시하지 않음
+# ✅ 비관리자 모드에서는 위 코드가 실행되지 않아 출석 현황이 표시되지 않음
+
