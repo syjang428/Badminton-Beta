@@ -345,62 +345,55 @@ def split_today_status(df_att, all_members):
     return df_attended, df_absented, df_unchecked, len(all_members)
 
 
-# ====== 관리자 대시보드 표시 ======
-# ================== 관리자 대시보드 표시용 (안전 수정) ==================
-# =================== 관리자 대시보드 표시용 (컬럼 자동 탐색) ===================
-# ====== 관리자 대시보드 표시 ======
-# ================== 관리자 대시보드 표시 (출석/결석/미체크) ==================
+# ====== 출석 현황: 모두에게 표시, 다운로드는 관리자만 ======
+st.markdown("---")
+st.subheader("📊 오늘의 출석 현황")
+
+# 데이터 불러오기
+att_df = get_attendance_df()
+
+# 오늘 기준 분류 (기존 함수 그대로 사용)
+df_attended, df_absented, df_unchecked, total_members = split_today_status(att_df, df)
+
+# 지표
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("총 인원", total_members)
+col2.metric("출석", len(df_attended))
+col3.metric("결석", len(df_absented))
+col4.metric("미체크", len(df_unchecked))
+
+# === 컬럼 안전 매핑 & 선택 유틸 ===
+def map_columns_safe(df_):
+    if df_.empty:
+        return None, None, None
+    col_name = next((c for c in df_.columns if "이름" in c or "성명" in c), None)
+    col_time = next((c for c in df_.columns if "시간" in c or "날짜" in c or "등록" in c), None)
+    col_status = next((c for c in df_.columns if "출석" in c or "상태" in c), None)
+    return col_name, col_time, col_status
+
+def safe_select(df_, cols):
+    existing = [c for c in cols if c and c in df_.columns]
+    if not existing:
+        return pd.DataFrame(columns=[c for c in cols if c])
+    return df_[existing]
+
+name_col, time_col, status_col = map_columns_safe(df_attended)
+
+# 표 표시
+st.markdown("#### ✅ 출석자")
+attended_display = safe_select(df_attended, [name_col, time_col, status_col])
+st.table(attended_display)
+
+st.markdown("#### ❌ 결석자")
+absented_display = safe_select(df_absented, [name_col, time_col, status_col])
+st.table(absented_display)
+
+st.markdown("#### ⏳ 미체크자")
+unchecked_display = df_unchecked[["이름"]] if not df_unchecked.empty else df_unchecked
+st.table(unchecked_display)
+
+# 🔒 CSV 다운로드는 관리자만
 if st.session_state.admin_mode:
-    st.markdown("---")
-    st.subheader("📊 오늘의 출석 현황 (관리자)")
-
-    # 데이터 불러오기
-    att_df = get_attendance_df()
-    
-    # 오늘 기준으로 출석/결석/미체크 분류
-    df_attended, df_absented, df_unchecked, total_members = split_today_status(att_df, df)
-
-    # 지표
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("총 인원", total_members)
-    col2.metric("출석", len(df_attended))
-    col3.metric("결석", len(df_absented))
-    col4.metric("미체크", len(df_unchecked))
-
-    # ==== 컬럼 안전 매핑 함수 정의 ====
-    def map_columns_safe(df):
-        if df.empty:
-            return None, None, None
-        col_name = next((c for c in df.columns if "이름" in c or "성명" in c), None)
-        col_time = next((c for c in df.columns if "시간" in c or "날짜" in c or "등록" in c), None)
-        col_status = next((c for c in df.columns if "출석" in c or "상태" in c), None)
-        return col_name, col_time, col_status
-
-    name_col, time_col, status_col = map_columns_safe(df_attended)
-
-    # ==== 안전하게 컬럼 선택 함수 ====
-    def safe_select(df, cols):
-        existing = [c for c in cols if c and c in df.columns]
-        if not existing:
-            return pd.DataFrame(columns=[c for c in cols if c])
-        return df[existing]
-
-    # 출석/결석/미체크 표시
-    attended_display = safe_select(df_attended, [name_col, time_col, status_col])
-    absented_display = safe_select(df_absented, [name_col, time_col, status_col])
-    unchecked_display = safe_select(df_unchecked, ["이름"])  # ✅ 여기 반드시 "이름" 사용
-
-    # ==== 표 표시 ====
-    st.markdown("#### ✅ 출석자")
-    st.table(attended_display)
-
-    st.markdown("#### ❌ 결석자")
-    st.table(absented_display)
-
-    st.markdown("#### ⏳ 미체크자")
-    st.table(unchecked_display)
-
-    # ==== CSV 다운로드 버튼 ====
     colD1, colD2, colD3 = st.columns(3)
     colD1.download_button(
         "출석자 CSV 다운로드",
