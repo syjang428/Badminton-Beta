@@ -8,6 +8,8 @@ import threading
 import uuid
 from gspread.exceptions import APIError
 
+st.set_page_config(page_title="서천고 출석", initial_sidebar_state="collapsed")
+
 @st.cache_resource
 def get_sheet_lock():
     # 서버 프로세스 전역에서 하나만 생성되어 모든 세션이 공유
@@ -190,6 +192,15 @@ if st.session_state.admin_mode:
 
 # ------------------ 사용자 출석 체크 ------------------
 st.header("🏸 서천고 배드민턴부 출석 체크")
+
+# --- 페널티 페이지로 이동 버튼/링크 ---
+st.markdown("### 🔗 관리자용 단축 이동")
+# Streamlit 1.22+ 에서만 버튼 전환 가능
+if hasattr(st, "switch_page"):
+    if st.button("📝 페널티 페이지로 이동", type="primary"):
+        st.switch_page("pages/페널티.py")
+# 버전 호환/새 탭 열기용 링크도 항상 제공
+st.page_link("pages/페널티.py", label="📝 페널티 페이지 열기", icon="📝")
 
 name = st.text_input("이름")
 personal_code = st.text_input("개인 고유번호", type="password")
