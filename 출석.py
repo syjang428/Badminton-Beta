@@ -205,7 +205,7 @@ st.page_link("pages/페널티.py", label="📝 페널티 페이지 열기", icon
 name = st.text_input("이름")
 personal_code = st.text_input("개인 고유번호", type="password")
 status = st.radio("출석 상태 선택", ["출석", "결석"])
-
+    
 
 if "attendance_input" not in st.session_state:
     st.session_state.attendance_input = ""
