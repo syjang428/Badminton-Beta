@@ -46,7 +46,7 @@ def load_members_csv(path: str, mtime: float) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=["이름", "고유번호"])
     try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
+        df = pd.read_csv(path, encoding="utf-8-sig", dtype={"고유번호":str})
     except UnicodeDecodeError:
         df = pd.read_csv(path)
     for col in ["이름", "고유번호"]:
