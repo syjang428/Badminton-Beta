@@ -7,13 +7,30 @@ import time
 from gspread.exceptions import APIError
 import pandas as pd
 import os
+from common_io import get_workbook, get_sheet
 
 st.page_link("출석.py", label="⬅️ 돌아가기")
+
+# 🔇 재실행 흐림/반투명 제거 + 상태 스피너 숨김 (본문+사이드바)
+st.markdown("""
+<style>
+[data-stale="true"] { filter: none !important; opacity: 1 !important; }
+[data-testid="stAppViewContainer"] [data-stale="true"],
+[data-testid="stSidebar"] [data-stale="true"],
+[data-testid="stAppViewBlockContainer"] [data-stale="true"] {
+  filter: none !important; opacity: 1 !important;
+}
+[data-testid="stStatusWidget"] { visibility: hidden !important; }
+[data-testid="stSidebar"] [data-testid="stStatusWidget"] { visibility: hidden !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ================== 설정 ==================
 SPREADSHEET_NAME = "출석"         # 구글 스프레드시트 파일명
 WS_PENALTY = "페널티기록"          # 페널티 기록 탭
 MEMBERS_CSV = "부원명단.csv"        # 이름/고유번호가 들어있는 CSV
+
+sheet_penalty = get_sheet(SPREADSHEET_NAME, WS_PENALTY)
 
 # 점수 규칙/기본 사유 (원하면 자유롭게 수정)
 reasons_dict = {"홍길동": "지각", "김철수": "결석", "이영희": "무단조퇴"}
@@ -22,19 +39,6 @@ points_dict  = {"지각": -1, "결석": -3, "무단조퇴": -2}
 # 관리자 비밀번호 (secrets.toml 권장)
 ADMIN_PASS = st.secrets.get("admin_password", None)
 
-# ================== 구글 시트 연결 (캐싱) ==================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-@st.cache_resource
-def get_penalty_sheet():
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return client.open(SPREADSHEET_NAME).worksheet(WS_PENALTY)
-
-sheet_penalty = get_penalty_sheet()
 
 # ================== 멤버 CSV 로드 ==================
 @st.cache_data
@@ -68,26 +72,45 @@ sheet_lock = get_sheet_lock()
 
 _RETRY_HINTS = ("rate limit", "quota", "backenderror", "internal error", "timeout", "429", "503", "500")
 
-def safe_append_row(ws, row_values, max_retries=7):
-    """ append_row를 전역 락 + 지수 백오프로 안전하게 """
+def safe_append_row(ws, row_values, max_retries=12):
+    """ append_row를 전역 락 + 지수 백오프(+지터)로 안정 처리 """
     delay = 0.6
     for attempt in range(1, max_retries + 1):
         try:
             with sheet_lock:
                 ws.append_row(row_values, value_input_option="RAW")
             return True
+
         except APIError as e:
             msg = str(e).lower()
-            if any(h in msg for h in _RETRY_HINTS) and attempt < max_retries:
-                time.sleep(delay)
-                delay *= 1.8
+            transient = any(h in msg for h in _RETRY_HINTS) or \
+                        "deadline" in msg or "socket" in msg or \
+                        "ratelimitexceeded" in msg or "quotaexceeded" in msg
+            if transient and attempt < max_retries:
+                time.sleep(delay + __import__("random").random() * 0.5)  # 지터
+                delay = min(delay * 1.8, 20.0)
                 continue
-            raise
+            raise  # 비일시 오류는 상향
+
+        except (TimeoutError,):
+            if attempt < max_retries:
+                time.sleep(delay + __import__("random").random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(delay + __import__("random").random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+    return False
 
 # ================== 공용 유틸 ==================
-@st.cache_data(ttl=60)   # 60초마다 자동 갱신
-def load_penalties_df() -> pd.DataFrame:
-    rows = get_penalty_sheet().get_all_records()
+@st.cache_data(ttl=60)
+def load_penalties_df(_sheet=sheet_penalty) -> pd.DataFrame:
+    rows = _sheet.get_all_records()
     df = pd.DataFrame(rows)
     if df.empty:
         df = pd.DataFrame(columns=["시간", "이름", "사유", "점수", "누적 점수"])

@@ -6,9 +6,41 @@ from google.oauth2.service_account import Credentials
 import time
 import threading
 import uuid
+import zoneinfo   # ✅ 추가
 from gspread.exceptions import APIError
+import random
+from requests.exceptions import RequestException, Timeout, ConnectionError
+import hashlib  # ✅ 추가
+from common_io import get_sheet
+
+# ✅ 한국 시간대 설정 (전역에서 재사용)
+KST = zoneinfo.ZoneInfo("Asia/Seoul")
 
 st.set_page_config(page_title="서천고 출석", initial_sidebar_state="collapsed")
+
+# ------------------ 페이지 이동 아이콘 ------------------
+st.page_link("pages/페널티.py", label=" 페널티 페이지", icon="🔖")
+
+
+# 🔇 재실행 흐림/반투명 제거 + 우상단/사이드바 스피너 숨김
+st.markdown("""
+<style>
+/* 본문/사이드바 재실행 시 붙는 흐림/반투명 제거 */
+[data-stale="true"] { filter: none !important; opacity: 1 !important; }
+
+/* 레이아웃 컨테이너들이 stale이어도 흐리지 않기 */
+[data-testid="stAppViewContainer"] [data-stale="true"],
+[data-testid="stSidebar"] [data-stale="true"],
+[data-testid="stAppViewBlockContainer"] [data-stale="true"] {
+  filter: none !important; opacity: 1 !important;
+}
+
+/* 우상단 'Running…' 스피너 숨김 */
+[data-testid="stStatusWidget"] { visibility: hidden !important; }
+/* 사이드바 안의 상태 위젯도 숨김 (환경에 따라 표시될 수 있음) */
+[data-testid="stSidebar"] [data-testid="stStatusWidget"] { visibility: hidden !important; }
+</style>
+""", unsafe_allow_html=True)
 
 @st.cache_resource
 def get_sheet_lock():
@@ -19,11 +51,11 @@ sheet_lock = get_sheet_lock()
 
 _RETRY_HINTS = ("rate limit", "quota", "backendError", "internal error", "timeout", "429", "503", "500")
 
-def safe_append_row(ws, row_values, max_retries=7):
+def safe_append_row(ws, row_values, max_retries=12):
     """
-    Google Sheets append_row 안전 호출:
+    Google Sheets append_row 안전 호출(고동시성 대응):
     - 전역 락으로 동시 호출 직렬화
-    - 429/5xx/일시 오류 지수 백오프 재시도
+    - 429/5xx/네트워크 예외에 지수 백오프 + 지터
     """
     delay = 0.6
     for attempt in range(1, max_retries + 1):
@@ -31,55 +63,129 @@ def safe_append_row(ws, row_values, max_retries=7):
             with sheet_lock:
                 ws.append_row(row_values, value_input_option="USER_ENTERED")
             return True
+
         except APIError as e:
             msg = str(e).lower()
-            if any(h in msg for h in _RETRY_HINTS):
-                time.sleep(delay)
-                delay = min(delay * 2, 8.0)
+            # 흔한 일시 오류 신호들
+            transient = any(h in msg for h in _RETRY_HINTS) or \
+                        "deadline" in msg or "socket" in msg or \
+                        "ratelimitexceeded" in msg or "quotaexceeded" in msg
+            if transient and attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)  # 지터
+                delay = min(delay * 1.8, 20.0)
                 continue
-            raise
+            raise  # 비일시 오류 → 즉시 상향
+
+        except (Timeout, ConnectionError, RequestException):
+            if attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+
         except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 8.0)
+            if attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+
     return False
 
-@st.cache_data(ttl=30)
-def existing_tokens(_ws, sheet_key: str):
+def daily_token(name: str, date_str: str) -> str:
     """
-    _ws: gspread Worksheet (언더스코어 → 캐시 해시 대상에서 제외)
-    sheet_key: 캐시 키로 쓸 해시 가능한 문자열(스프레드시트ID:워크시트ID/제목)
+    같은 사람이 같은 날에 여러 번 저장되지 않도록 고정 토큰 생성.
+    (하루 1명 1건 정책 / 여러 번 허용하려면 date_str 뒤에 |status|time_slot 등 포함)
+    """
+    base = f"{name.strip()}|{date_str}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+
+def _read_tokens_fresh(ws) -> set[str]:
+    """락 구간에서 캐시된 '토큰' 열 인덱스 활용(빠름), 실패 시 폴백."""
+    try:
+        col_idx = _get_token_col_index(ws, SHEET_KEY)
+        if col_idx:
+            vals = ws.col_values(col_idx)[1:]  # 헤더 제외
+            return {str(v).strip() for v in vals if v}
+        # 폴백: 전체 레코드에서 '토큰' 키만 추출
+        records = ws.get_all_records()
+        return {str(r.get("토큰", "")).strip() for r in records if r.get("토큰")}
+    except Exception:
+        return set()
+
+def append_once(ws, values, max_retries=12):
+    """
+    확인+쓰기까지 '한 번의 락'으로 묶어 중복을 원천 차단.
+    이미 같은 토큰이 있으면 쓰지 않고 True 반환(성공 취급).
+    """
+    delay = 0.6
+    for attempt in range(1, max_retries + 1):
+        try:
+            with sheet_lock:
+                token = str(values[-1]).strip()
+                tokens = _read_tokens_fresh(ws)
+                if token in tokens:
+                    return True  # 누가 먼저 썼음 → 중복 방지 OK
+
+                ws.append_row(values, value_input_option="USER_ENTERED")
+                st.cache_data.clear()  # ✅ 성공 직후 캐시 무효화
+                return True
+
+        except APIError as e:
+            msg = str(e).lower()
+            transient = any(h in msg for h in _RETRY_HINTS) or \
+                        "deadline" in msg or "socket" in msg or \
+                        "ratelimitexceeded" in msg or "quotaexceeded" in msg
+            if transient and attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 1.8, 20.0)
+                continue
+            raise
+        except (Timeout, ConnectionError, RequestException):
+            if attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(delay + random.random() * 0.5)
+                delay = min(delay * 1.8, 12.0)
+                continue
+            return False
+    return False
+
+@st.cache_data(ttl=600)
+def _get_token_col_index(_ws, sheet_key: str) -> int | None:
+    """'토큰' 헤더가 있는 열 인덱스를 캐싱(1-base). 못 찾으면 None."""
+    try:
+        cell = _ws.find("토큰")  # 헤더 탐색(비용 큼) → 10분 캐싱
+        return cell.col if cell else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=30)
+def existing_tokens(_ws, sheet_key: str) -> set[str]:
+    """
+    토큰 열만 읽어서 Set으로 반환(부하 최소화).
+    - 토큰 열을 못 찾으면 기존 전체 레코드 fallback.
     """
     try:
+        col_idx = _get_token_col_index(_ws, sheet_key)
+        if col_idx:
+            # 헤더(1행) 제외
+            vals = _ws.col_values(col_idx)[1:]
+            return {str(v).strip() for v in vals if v}
+        # fallback: 전체 레코드
         records = _ws.get_all_records()
         return {str(r.get("토큰", "")).strip() for r in records if r.get("토큰")}
     except Exception:
         return set()
+
     
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-@st.cache_resource
-def get_gspread_client():
-    # TOML에 triple-quoted로 넣었으면 \n 복원 필요 없음
-    svc_info = dict(st.secrets["gcp_service_account"])
-    # 만약 TOML에 한 줄 문자열로 넣어 \n이 이스케이프라면 아래 주석 해제
-    # svc_info["private_key"] = svc_info["private_key"].replace("\\n", "\n")
-
-    creds = Credentials.from_service_account_info(svc_info, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-client = get_gspread_client()
-
-
 SPREADSHEET_NAME = "출석"
-workbook = client.open(SPREADSHEET_NAME)
-
-
-sheet = workbook.worksheet("출석기록")    # 출석 기록용
-code_sheet = workbook.worksheet("출석코드")  # 출석 코드 저장용
+sheet = get_sheet(SPREADSHEET_NAME, "출석기록")
+code_sheet = get_sheet(SPREADSHEET_NAME, "출석코드")
 
 # 캐시 키(스프레드시트ID:워크시트ID) - gspread 버전에 따라 .id가 없으면 제목으로 폴백
 SHEET_KEY = f"{sheet.spreadsheet.id}:{getattr(sheet, 'id', sheet.title)}"
@@ -105,20 +211,74 @@ def split_today_status(df):
 
     return df_attended, df_absented, df_unchecked, total_members
 
-# ------------------ CSV 불러오기 ------------------
+# ------------------ CSV 불러오기 (고유번호 0 유지) ------------------
 @st.cache_data  # ✅ TTL 제거 → 완전 캐싱 (앱 새로 실행하기 전까지는 다시 안 불러옴)
 def load_members():
-    return pd.read_csv("부원명단.csv", encoding="utf-8-sig")
-
+    # "고유번호" 컬럼을 문자열(str)로 읽어 맨 앞 0 유지
+    return pd.read_csv("부원명단.csv", encoding="utf-8-sig", dtype={"고유번호": str})
 
 df = load_members()
+
+import re  # ← 상단 import 구역에 함께 추가
+
+@st.cache_data
+def build_gcn_map(members_df: pd.DataFrame) -> dict[str, tuple[int,int,int]]:
+    """
+    CSV에서 이름 → (학년, 반, 번호) 매핑 생성
+    - 컬럼이 '학년','반','번호'면 그대로 사용
+    - '학년반번호'(예: '1-3-12', '1학년 3반 12번') 형태도 파싱
+    - 없거나 파싱 실패 시 해당 이름은 매핑 생략(정렬 후순위로 처리)
+    """
+    m: dict[str, tuple[int,int,int]] = {}
+
+    # case 1) 분리 컬럼 존재
+    if {"학년", "반", "번호"}.issubset(members_df.columns):
+        for _, r in members_df.dropna(subset=["이름", "학년", "반", "번호"]).iterrows():
+            try:
+                name = str(r["이름"]).strip()
+                g = int(r["학년"])
+                c = int(r["반"])
+                n = int(r["번호"])
+                if name:
+                    # 동명이인 있을 경우 더 작은 (학,반,번)을 우선 보존
+                    m[name] = min(m.get(name, (999,999,999)), (g, c, n))
+            except Exception:
+                continue
+        return m
+
+    # case 2) 합쳐진 컬럼 찾기
+    merged_col = next(
+        (c for c in members_df.columns if c in ("학년반번호", "학년반", "학반번호")),
+        None
+    )
+    if merged_col:
+        for _, r in members_df.dropna(subset=["이름", merged_col]).iterrows():
+            name = str(r["이름"]).strip()
+            raw = str(r[merged_col])
+            nums = re.findall(r"\d+", raw)
+            if len(nums) >= 3:
+                try:
+                    g, c, n = int(nums[0]), int(nums[1]), int(nums[2])
+                    if name:
+                        m[name] = min(m.get(name, (999,999,999)), (g, c, n))
+                except Exception:
+                    continue
+
+    return m
+
+GCN_MAP = build_gcn_map(df)
+
+def _gcn_tuple_for(name: str) -> tuple[int,int,int]:
+    """이름으로 (학년,반,번호) 조회. 없으면 정렬 후순위 키 반환"""
+    return GCN_MAP.get(str(name).strip(), (999, 999, 999))
 
 
 # ------------------ 출석 코드 불러오기 ------------------
 @st.cache_data(ttl=60)  # 1분 캐싱
 def get_latest_code():
     try:
-        return code_sheet.acell("A1").value or ""
+        value = code_sheet.acell("A1").value or ""
+        return str(value)  # 앞자리 0 유지
     except:
         return ""
 
@@ -163,25 +323,25 @@ if st.session_state.admin_mode:
 
 
     with st.sidebar.expander("관리자 기능"):
-        code_input = st.text_input(
-            "오늘의 출석 코드 입력",
-            value=st.session_state.admin_code,
-            type="password"
-        )
-        if st.button("출석 코드 저장"):
-            if code_input.strip() != "":
-                st.session_state.admin_code = code_input
-                # clear/append도 경합 방지
-                with sheet_lock:
-                    code_sheet.clear()
-                ok = safe_append_row(code_sheet, [code_input, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                if ok:
-                    st.success("출석 코드가 저장되었습니다.")
-                    st.cache_data.clear()
-                else:
-                    st.error("코드 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        # 코드 저장을 폼으로 감싸서 재실행 최소화
+        with st.form("admin_code_form", clear_on_submit=False):
+            code_input = st.text_input("오늘의 출석 코드 입력",
+                                    value=st.session_state.admin_code,
+                                    type="password")
+            save_code = st.form_submit_button("출석 코드 저장")
 
+        if save_code and code_input.strip() != "":
+            st.session_state.admin_code = code_input
+            with sheet_lock:
+                code_sheet.clear()
+            ok = safe_append_row(code_sheet, [str(code_input), datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")])
+            if ok:
+                st.cache_data.clear()
+                st.success("출석 코드가 저장되었습니다.")
+            else:
+                st.error("코드 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
+        # 모드 해제는 폼 밖 일반 버튼으로 유지
         if st.button("관리자 모드 해제"):
             st.session_state.admin_mode = False
             st.session_state.admin_code = ""
@@ -189,119 +349,104 @@ if st.session_state.admin_mode:
             st.sidebar.warning("관리자 모드가 해제되었습니다 ⚠️")
             st.rerun()
 
-
 # ------------------ 사용자 출석 체크 ------------------
-st.header("🏸 서천고 배드민턴부 출석 체크")
+st.header("🏸 배드민턴부 출석 체크")
 
-# --- 페널티 페이지로 이동 버튼/링크 ---
-st.markdown("### 🔗 관리자용 단축 이동")
-# Streamlit 1.22+ 에서만 버튼 전환 가능
-if hasattr(st, "switch_page"):
-    if st.button("📝 페널티 페이지로 이동", type="primary"):
-        st.switch_page("pages/페널티.py")
-# 버전 호환/새 탭 열기용 링크도 항상 제공
-st.page_link("pages/페널티.py", label="📝 페널티 페이지 열기", icon="📝")
+with st.form("attendance_form", clear_on_submit=False):
+    # ✅ 맨 위: 출석 여부 → 시간대 → 활동 부원
+    status = st.radio("출석 여부", ["출석", "결석"], key="status_radio")
 
-name = st.text_input("이름")
-personal_code = st.text_input("개인 고유번호", type="password")
-status = st.radio("출석 상태 선택", ["출석", "결석"])
-    
+    if status == "출석":
+        time_slot = st.selectbox(
+            "시간대 선택",
+            ["1:00", "1:10", "1:20", "1:30", "1:40", "1:50"],
+            key="time_slot_select"
+        )
+        partner = st.text_input(
+            "오늘 같이 활동한 부원들 이름",
+            key="partner_input"
+        )
+    else:
+        time_slot = ""
+        partner = ""
 
-if "attendance_input" not in st.session_state:
-    st.session_state.attendance_input = ""
-if "absence_reason" not in st.session_state:
-    st.session_state.absence_reason = ""
+    # ✅ 그 다음: 이름 / 고유번호
+    name = st.text_input("이름")
+    personal_code = st.text_input("고유번호 (전화번호 뒷자리)", type="password")
 
-# 상태에 따라 입력란 표시
-if status == "출석":
-    # ✅ 출석일 때만 시간대 선택
-    time_slot = st.selectbox(
-        "시간대 선택",
-        ["1:00", "1:10", "1:20", "1:30", "1:40", "1:50"],
-        key="time_slot_select"   # 🔑 고유 key 지정
-    )
+    # ✅ 출석 코드 / 결석 사유
+    if "attendance_input" not in st.session_state:
+        st.session_state.attendance_input = ""
+    if "absence_reason" not in st.session_state:
+        st.session_state.absence_reason = ""
 
-    partner = st.text_input(
-        "오늘 같이 활동한 사람 이름 (여러 명일 경우 , 로 구분)",
-        key="partner_input"
-    )
+    if status == "출석":
+        latest_code = get_latest_code()
+        st.session_state.attendance_input = st.text_input(
+            "오늘의 출석 코드",
+            value=st.session_state.attendance_input,
+            key="attendance_code_input"
+        )
+    else:
+        st.session_state.absence_reason = st.text_area(
+            "결석 사유를 입력하세요",
+            value=st.session_state.absence_reason,
+            key="absence_reason_input"
+        )
 
-    latest_code = get_latest_code()
-    st.session_state.attendance_input = st.text_input(
-        "오늘의 출석 코드",
-        value=st.session_state.attendance_input,
-        key="attendance_code_input"
-    )
+    # ✅ 제출 버튼 맨 아래
+    submitted = st.form_submit_button("제출")
 
-elif status == "결석":
-    st.session_state.absence_reason = st.text_area(
-        "결석 사유를 입력하세요",
-        value=st.session_state.absence_reason,
-        key="absence_reason_input"
-    )
-    partner = ""  # 결석일 때는 partner 값 비워주기
+# ✅ 기존 제출 로직을 submitted가 True일 때만 실행
+if submitted:
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
-
-
-
-# ------------------ 제출 ------------------
-if st.button("제출"):
+    # 이름/개인번호 확인
     if not ((df["이름"] == name) & (df["고유번호"].astype(str) == personal_code)).any():
         st.error("이름 또는 개인 고유번호가 올바르지 않습니다.")
-        st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
     else:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         if status == "출석":
             if partner.strip() == "":
                 st.error("오늘 같이 활동한 사람을 입력하세요.")
             else:
-                latest_code = get_latest_code()
-                if st.session_state.attendance_input.strip() == "":
-                    st.error("출석 코드를 입력하세요.")
-                elif st.session_state.attendance_input != latest_code:
+                input_code = str(st.session_state.attendance_input).strip()
+                saved_code = str(get_latest_code()).strip()
+
+                if input_code != saved_code:
                     st.error("출석 코드가 올바르지 않습니다.")
                     st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
                 else:
-                    token = str(uuid.uuid4())[:8]  # idempotency 토큰
-                    values = [name, now_str, "출석", time_slot, partner, "", token]  # 마지막에 '토큰' 컬럼 추가
+                    # ✅ 코드가 맞으면 출석 기록 처리 (append_once 사용)
+                    date_key = datetime.now(KST).strftime("%Y-%m-%d")   # 하루 1건 정책
+                    token = daily_token(name, date_key)
+                    values = [name, now_str, "출석", time_slot, partner, "", token]
 
-                    tokens = existing_tokens(sheet, SHEET_KEY)
-                    if token in tokens:
-                        st.info("이미 처리된 요청입니다 (중복 제출 방지).")
+                    ok = append_once(sheet, values)
+                    if ok:
+                        st.success(f"{name}님 출석 완료 ✅")
+                        st.session_state.local_attendance = st.session_state.get("local_attendance", [])
+                        st.session_state.local_attendance.append(values)
+                        st.session_state.attendance_input = ""
+                        st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
                     else:
-                        ok = safe_append_row(sheet, values)
-                        if ok:
-                            st.success(f"{name}님 출석 완료 ✅")
-                            if "local_attendance" not in st.session_state:
-                                st.session_state.local_attendance = []
-                            st.session_state.local_attendance.append(values)
-                            st.cache_data.clear()
-                            st.session_state.attendance_input = ""
-                            st.warning("⚠️ 거짓이나 꾸며서 입력했을 시 바로 퇴출됩니다.")
-                        else:
-                            st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+                        st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
         elif status == "결석":
             if st.session_state.absence_reason.strip() == "":
                 st.error("결석 사유를 입력하세요.")
             else:
-                token = str(uuid.uuid4())[:8]
+                date_key = datetime.now(KST).strftime("%Y-%m-%d")
+                token = daily_token(name, date_key)
                 values = [name, now_str, "결석", "", "", st.session_state.absence_reason, token]
 
-                tokens = existing_tokens(sheet, SHEET_KEY)
-                if token in tokens:
-                    st.info("이미 처리된 요청입니다 (중복 제출 방지).")
+                ok = append_once(sheet, values)
+                if ok:
+                    st.success(f"{name}님 결석 처리 완료 ✅")
+                    st.session_state.local_attendance = st.session_state.get("local_attendance", [])
+                    st.session_state.local_attendance.append(values)
                 else:
-                    ok = safe_append_row(sheet, values)
-                    if ok:
-                        st.success(f"{name}님 결석 처리 완료 ✅")
-                        if "local_attendance" not in st.session_state:
-                            st.session_state.local_attendance = []
-                        st.session_state.local_attendance.append(values)
-                        st.cache_data.clear()
-                    else:
-                        st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+                    st.error("일시적 오류로 저장에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+
 
 
 # ================== 출석 현황 대시보드 (관리자 전용) ==================
@@ -357,16 +502,18 @@ def split_today_status(df_att, all_members):
 
 
 # ====== 출석 현황: 모두에게 표시, 다운로드는 관리자만 ======
+# ================== 출석 현황 대시보드 (관리자 전용) ==================
+# ================== 출석 현황 대시보드 ==================
 st.markdown("---")
 st.subheader("📊 오늘의 출석 현황")
 
 # 데이터 불러오기
 att_df = get_attendance_df()
 
-# 오늘 기준 분류 (기존 함수 그대로 사용)
+# 오늘 기준 분류
 df_attended, df_absented, df_unchecked, total_members = split_today_status(att_df, df)
 
-# 지표
+# 지표 (관리자/비관리자 모두 표시)
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("총 인원", total_members)
 col2.metric("출석", len(df_attended))
@@ -390,18 +537,48 @@ def safe_select(df_, cols):
 
 name_col, time_col, status_col = map_columns_safe(df_attended)
 
-# 표 표시
-st.markdown("#### ✅ 출석자")
-attended_display = safe_select(df_attended, [name_col, time_col, status_col])
-st.table(attended_display)
+# 출석자
+# === 출석자 ===
+# === 출석자 ===
+with st.expander("✅ 출석자 명단 보기", expanded=False):
+    attended_display = safe_select(df_attended, [name_col, time_col, status_col]).copy()
+    if not attended_display.empty:
+        attended_display["_g"] = attended_display[name_col].map(lambda n: _gcn_tuple_for(n)[0])
+        attended_display["_c"] = attended_display[name_col].map(lambda n: _gcn_tuple_for(n)[1])
+        attended_display["_n"] = attended_display[name_col].map(lambda n: _gcn_tuple_for(n)[2])
+        attended_display = (
+            attended_display
+            .sort_values(by=["_g", "_c", "_n", name_col], kind="stable")
+            .drop(columns=["_g", "_c", "_n"])
+        )
 
-st.markdown("#### ❌ 결석자")
-absented_display = safe_select(df_absented, [name_col, time_col, status_col])
-st.table(absented_display)
+        if st.session_state.admin_mode:
+            selected_attendees = []
+            for idx, row in attended_display.iterrows():
+                col1, col2, col3 = st.columns([2, 3, 2])
+                with col1:
+                    checked = st.checkbox(row[name_col], key=f"attendee_{idx}")
+                with col2:
+                    st.write(row[time_col])
+                with col3:
+                    st.write(row[status_col])
+                if checked:
+                    selected_attendees.append(row[name_col])
+            st.info(f"선택된 출석자: {', '.join(selected_attendees) if selected_attendees else '없음'}")
+        else:
+            st.table(attended_display)
+    else:
+        st.write("출석자가 없습니다.")
 
-st.markdown("#### ⏳ 미체크자")
-unchecked_display = df_unchecked[["이름"]] if not df_unchecked.empty else df_unchecked
-st.table(unchecked_display)
+# === 결석자 ===
+with st.expander("❌ 결석자 명단 보기", expanded=False):
+    absented_display = safe_select(df_absented, [name_col, time_col, status_col])
+    st.table(absented_display)
+
+# === 미체크자 ===
+with st.expander("⏳ 미체크자 명단 보기", expanded=False):
+    unchecked_display = df_unchecked[["이름"]] if not df_unchecked.empty else df_unchecked
+    st.table(unchecked_display)
 
 # 🔒 CSV 다운로드는 관리자만
 if st.session_state.admin_mode:
