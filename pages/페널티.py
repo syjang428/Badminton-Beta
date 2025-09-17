@@ -149,15 +149,13 @@ tab_me, tab_admin = st.tabs(["내 페널티 조회", "관리자 입력"])
 # -------- 내 페널티 조회 (메인) --------
 with tab_me:
     st.subheader("👤 본인 페널티 조회")
-    my_name = st.selectbox("이름 선택", options=["(선택)"] + name_options, index=0)
+    my_name = st.text_input("이름 입력").strip()
     my_code = st.text_input("고유번호", type="password", help=f"'{MEMBERS_CSV}'의 고유번호와 일치해야 합니다.")
 
     if st.button("조회"):
-        if my_name == "(선택)":
-            st.error("이름을 선택해주세요.")
+        if not my_name:
+            st.error("이름을 입력해주세요.")
         elif not verify_member(my_name, my_code):
-            # CSV에 고유번호가 없다면 verify_member가 이름만으로 통과 처리함
-            # 여기서는 불일치인 경우만 에러 표시
             st.error("이름 또는 고유번호가 일치하지 않습니다.")
         else:
             df = load_penalties_df()
@@ -197,10 +195,8 @@ with tab_admin:
         # ✅ 모든 입력을 '한 폼' 안에서 처리 (콜백 없음)
         with st.form("penalty_add_form", clear_on_submit=False):
             # 이름
-            sel_name = st.selectbox("이름 선택", options=["(선택)"] + name_options, index=0)
-
-            # 기본 사유/점수 제안 (이름 기반)
-            default_reason = reasons_dict.get(sel_name, "") if sel_name and sel_name != "(선택)" else ""
+            typed_name = st.text_input("이름 입력").strip()
+            default_reason = reasons_dict.get(typed_name, "") if typed_name else ""
             reason = st.text_input("사유 입력", value=default_reason,
                                    placeholder="예: 무단 결석 / 뒷정리 안함 / 불화 조성 등")
 
@@ -213,12 +209,11 @@ with tab_admin:
             submitted = st.form_submit_button("➕ 페널티 추가")
 
         if submitted:
-            name = sel_name
+            name = typed_name
             reason_val = (reason or "").strip()
-            # ✅ 제출 시 최종 점수 확정
             point_val = int(points_dict.get(reason_val, point)) if auto_calc else int(point)
 
-            if name == "(선택)" or not reason_val:
+            if not name or not reason_val:
                 st.error("이름과 사유를 모두 입력하세요.")
             else:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
