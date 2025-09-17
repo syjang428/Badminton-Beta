@@ -1,6 +1,8 @@
 import streamlit as st
 import gspread
 from datetime import datetime
+import zoneinfo  # ✅ 추가
+KST = zoneinfo.ZoneInfo("Asia/Seoul")  # ✅ 추가
 from google.oauth2.service_account import Credentials
 import threading
 import time
@@ -216,7 +218,7 @@ with tab_admin:
             if not name or not reason_val:
                 st.error("이름과 사유를 모두 입력하세요.")
             else:
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                 df_now = load_penalties_df()
                 total_score = calc_total_for_name(name, df_now) + point_val
                 try:
