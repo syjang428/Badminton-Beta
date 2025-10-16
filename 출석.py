@@ -352,10 +352,10 @@ if st.session_state.admin_mode:
 # ------------------ 사용자 출석 체크 ------------------
 st.header("🏸 배드민턴부 출석 체크")
 
-with st.form("attendance_form", clear_on_submit=False):
-    # ✅ 맨 위: 출석 여부 → 시간대 → 활동 부원
-    status = st.radio("출석 여부", ["출석", "결석"], key="status_radio")
+# ✅ 폼 바깥으로 이동 (라디오 바꾸면 즉시 화면 전환)
+status = st.radio("출석 여부", ["출석", "결석"], key="status_radio")
 
+with st.form("attendance_form", clear_on_submit=False):
     if status == "출석":
         time_slot = st.selectbox(
             "시간대 선택",
@@ -366,21 +366,8 @@ with st.form("attendance_form", clear_on_submit=False):
             "오늘 같이 활동한 부원들 이름",
             key="partner_input"
         )
-    else:
-        time_slot = ""
-        partner = ""
-
-    # ✅ 그 다음: 이름 / 고유번호
-    name = st.text_input("이름")
-    personal_code = st.text_input("고유번호 (전화번호 뒷자리)", type="password")
-
-    # ✅ 출석 코드 / 결석 사유
-    if "attendance_input" not in st.session_state:
-        st.session_state.attendance_input = ""
-    if "absence_reason" not in st.session_state:
-        st.session_state.absence_reason = ""
-
-    if status == "출석":
+        if "attendance_input" not in st.session_state:
+            st.session_state.attendance_input = ""
         latest_code = get_latest_code()
         st.session_state.attendance_input = st.text_input(
             "오늘의 출석 코드",
@@ -388,13 +375,20 @@ with st.form("attendance_form", clear_on_submit=False):
             key="attendance_code_input"
         )
     else:
+        time_slot = ""
+        partner = ""
+        if "absence_reason" not in st.session_state:
+            st.session_state.absence_reason = ""
         st.session_state.absence_reason = st.text_area(
             "결석 사유를 입력하세요",
             value=st.session_state.absence_reason,
             key="absence_reason_input"
         )
 
-    # ✅ 제출 버튼 맨 아래
+    # ✅ 공통: 이름 / 고유번호
+    name = st.text_input("이름", key="name_input")
+    personal_code = st.text_input("고유번호 (전화번호 뒷자리)", type="password", key="personal_code_input")
+
     submitted = st.form_submit_button("제출")
 
 # ✅ 기존 제출 로직을 submitted가 True일 때만 실행
